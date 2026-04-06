@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from errno import ENOBUFS
 from typing import Any
 
 import can
@@ -137,7 +138,16 @@ class SocketCANDevice:
         if not self.bus:
             raise RuntimeError("SocketCAN bus not connected")
         msg = can.Message(arbitration_id=frame_id, data=data, is_extended_id=True)
-        self.bus.send(msg)
+        retries = 5
+        for attempt in range(retries):
+            try:
+                self.bus.send(msg, timeout=0.2)
+                return
+            except can.CanOperationError as exc:
+                if exc.error_code != ENOBUFS or attempt == retries - 1:
+                    raise
+                # SocketCAN TX queue is full; wait briefly and retry.
+                time.sleep(0.01)
 
 
 # ===== Protocol utility functions =====
@@ -463,8 +473,13 @@ class SimulatorService:
     def send_once(self) -> None:
         if not self.connected:
             raise RuntimeError("Not connected")
-        for frame_id, data in self.current_frames():
+        frames = self.current_frames()
+        for index, (frame_id, data) in enumerate(frames):
             self.device.send(frame_id, data)
+            # Short pacing prevents bursts of fast-packet frames from overflowing
+            # small kernel TX queues on low-end interfaces.
+            if index != len(frames) - 1:
+                time.sleep(0.001)
 
     def send_switch_command(self, switch_number: int, state_on: bool) -> None:
         if not self.connected:
