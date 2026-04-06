@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from errno import ENOBUFS
 from typing import Any
 
 import can
@@ -137,7 +138,24 @@ class SocketCANDevice:
         if not self.bus:
             raise RuntimeError("SocketCAN bus not connected")
         msg = can.Message(arbitration_id=frame_id, data=data, is_extended_id=True)
-        self.bus.send(msg)
+        retries = 5
+        for attempt in range(retries):
+            try:
+                self.bus.send(msg, timeout=0.2)
+                return
+            except can.CanOperationError as exc:
+                error_code = getattr(exc, "error_code", None)
+                if error_code != ENOBUFS and "No buffer space available" not in str(exc):
+                    raise
+                if attempt == retries - 1:
+                    raise
+                # SocketCAN TX queue is full; wait briefly and retry.
+                time.sleep(0.01)
+
+    def recv(self, timeout: float = 0.0) -> can.Message | None:
+        if not self.bus:
+            return None
+        return self.bus.recv(timeout=timeout)
 
 
 # ===== Protocol utility functions =====
@@ -157,6 +175,19 @@ def nmea2000_id(priority: int, pgn: int, source_address: int, destination: int =
         | ((ps & 0xFF) << 8)
         | (source_address & 0xFF)
     )
+
+
+def extract_pgn_and_destination(frame_id: int) -> tuple[int, int]:
+    pf = (frame_id >> 16) & 0xFF
+    ps = (frame_id >> 8) & 0xFF
+    dp = (frame_id >> 24) & 0x01
+    if pf < 240:
+        pgn = (dp << 16) | (pf << 8)
+        destination = ps
+    else:
+        pgn = (dp << 16) | (pf << 8) | ps
+        destination = GLOBAL_DESTINATION
+    return pgn, destination
 
 
 def clamp_u16(value: float, scale: float, minimum: float = 0.0, maximum: float = 65535.0) -> int:
@@ -326,6 +357,8 @@ class SimulatorService:
         self.periodic_running = False
         self.periodic_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.rx_stop_event = threading.Event()
+        self.rx_thread: threading.Thread | None = None
         self.status = "Disconnected"
 
     def _source_address(self) -> int:
@@ -348,13 +381,26 @@ class SimulatorService:
         interface = CAN_INTERFACE_MAP[idx]
         self.device.connect(interface, self.config.bitrate)
         self.connected = True
+        self._start_receiver()
         self.status = f"Connected to {interface} @ {self.config.bitrate} bps"
 
     def disconnect(self) -> None:
         self.stop_periodic()
+        self._stop_receiver()
         self.device.disconnect(set_down=True)
         self.connected = False
         self.status = "Disconnected"
+
+    def _start_receiver(self) -> None:
+        self.rx_stop_event.clear()
+        self.rx_thread = threading.Thread(target=self._receiver_worker, daemon=True)
+        self.rx_thread.start()
+
+    def _stop_receiver(self) -> None:
+        self.rx_stop_event.set()
+        if self.rx_thread and self.rx_thread.is_alive():
+            self.rx_thread.join(timeout=1.0)
+        self.rx_thread = None
 
     def current_messages(self) -> list[ProtocolMessage]:
         cfg = self.config
@@ -454,6 +500,36 @@ class SimulatorService:
         self.fast_packet_sequence = (self.fast_packet_sequence + 1) & 0x07
         return [(frame_id, frame.ljust(8, b"\xFF")) for frame in frames]
 
+    def _messages_for_requested_pgn(self, requested_pgn: int) -> list[ProtocolMessage]:
+        return [msg for msg in self.current_messages() if msg.pgn == requested_pgn]
+
+    def _handle_iso_request(self, destination: int, data: bytes) -> None:
+        if len(data) < 3:
+            return
+        requested_pgn = data[0] | (data[1] << 8) | (data[2] << 16)
+        engine_src = self._source_address()
+        switch_src = self._switch_source_address()
+        if destination not in (GLOBAL_DESTINATION, engine_src, switch_src):
+            return
+        for message in self._messages_for_requested_pgn(requested_pgn):
+            for frame_id, frame_data in self._expand_protocol_message(message):
+                self.device.send(frame_id, frame_data)
+                time.sleep(0.001)
+
+    def _receiver_worker(self) -> None:
+        while not self.rx_stop_event.is_set():
+            try:
+                msg = self.device.recv(timeout=0.1)
+                if msg is None or not msg.is_extended_id:
+                    continue
+                pgn, destination = extract_pgn_and_destination(msg.arbitration_id)
+                if pgn == PGN_ISO_REQUEST:
+                    with self.lock:
+                        self._handle_iso_request(destination, bytes(msg.data))
+            except Exception as exc:
+                self.status = f"Receive error: {exc}"
+                return
+
     def current_frames(self) -> list[tuple[int, bytes]]:
         frames: list[tuple[int, bytes]] = []
         for message in self.current_messages():
@@ -463,8 +539,13 @@ class SimulatorService:
     def send_once(self) -> None:
         if not self.connected:
             raise RuntimeError("Not connected")
-        for frame_id, data in self.current_frames():
+        frames = self.current_frames()
+        for index, (frame_id, data) in enumerate(frames):
             self.device.send(frame_id, data)
+            # Short pacing prevents bursts of fast-packet frames from overflowing
+            # small kernel TX queues on low-end interfaces.
+            if index != len(frames) - 1:
+                time.sleep(0.001)
 
     def send_switch_command(self, switch_number: int, state_on: bool) -> None:
         if not self.connected:
