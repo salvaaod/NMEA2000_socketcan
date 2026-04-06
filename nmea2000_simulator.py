@@ -599,10 +599,15 @@ HTML_TEMPLATE = """
   <meta charset=\"utf-8\" />
   <title>NMEA2000 SocketCAN Simulator</title>
   <style>
-    body { font-family: sans-serif; margin: 1rem 2rem; }
-    fieldset { margin-bottom: 1rem; }
-    label { display:inline-block; min-width:220px; }
-    .grid { display:grid; grid-template-columns:repeat(4, minmax(240px, 1fr)); gap: 1rem; }
+    body { font-family: sans-serif; margin: 0.5rem 1rem; font-size: 14px; }
+    fieldset { margin-bottom: 0.5rem; padding: 0.4rem 0.5rem; }
+    label { display:inline-block; min-width:180px; }
+    .grid { display:grid; grid-template-columns:repeat(4, minmax(220px, 1fr)); gap: 0.5rem; }
+    .config-block { display:grid; grid-template-columns:minmax(120px, 1fr) minmax(80px, 120px); column-gap:0.5rem; row-gap:0.2rem; align-items:center; }
+    .config-block label { min-width:0; }
+    .config-block input { width:100%; box-sizing:border-box; padding:2px 4px; }
+    .config-block br { display:none; }
+    .config-block hr { grid-column:1 / -1; width:100%; margin:0.2rem 0; }
     .switches form { display:inline-block; margin:2px; }
   </style>
 </head>
@@ -612,14 +617,14 @@ HTML_TEMPLATE = """
 
   <form method=\"post\" action=\"{{ url_for('update') }}\">
     <div class=\"grid\">
-      <fieldset>
+      <fieldset class=\"config-block\">
         <legend>Connection</legend>
         <label>CAN interface index (0/1)</label><input name=\"can_interface_index\" value=\"{{ cfg.can_interface_index }}\" /><br/>
         <label>Bitrate</label><input name=\"bitrate\" value=\"{{ cfg.bitrate }}\" /><br/>
         <label>Interval ms</label><input name=\"interval_ms\" value=\"{{ cfg.interval_ms }}\" /><br/>
       </fieldset>
 
-      <fieldset>
+      <fieldset class=\"config-block\">
         <legend>Node addressing</legend>
         <label>Source address</label><input name=\"source_address\" value=\"{{ cfg.source_address }}\" /><br/>
         <label>Destination</label><input name=\"destination_address\" value=\"{{ cfg.destination_address }}\" /><br/>
@@ -627,7 +632,7 @@ HTML_TEMPLATE = """
         <label>Device NAME</label><input name=\"device_name\" value=\"{{ '0x%X' % cfg.device_name }}\" /><br/>
       </fieldset>
 
-      <fieldset>
+      <fieldset class=\"config-block\">
         <legend>Engine values</legend>
         <label>Speed rpm</label><input name=\"engine_speed_rpm\" value=\"{{ cfg.engine_speed_rpm }}\" /><br/>
         <label>Boost bar</label><input name=\"engine_boost_bar\" value=\"{{ cfg.engine_boost_bar }}\" /><br/>
@@ -644,7 +649,7 @@ HTML_TEMPLATE = """
         <label>Engine torque %</label><input name=\"engine_torque_percent\" value=\"{{ cfg.engine_torque_percent }}\" /><br/>
       </fieldset>
 
-      <fieldset>
+      <fieldset class=\"config-block\">
         <legend>Products + switch node</legend>
         <label>ISO request PGN</label><input name=\"iso_request_pgn\" value=\"{{ cfg.iso_request_pgn }}\" /><br/>
         <label>Product model</label><input name=\"product_model\" value=\"{{ cfg.product_model }}\" /><br/>
