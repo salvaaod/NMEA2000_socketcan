@@ -1,17 +1,26 @@
-import ctypes
-import os
-import platform
-import tkinter as tk
-from dataclasses import dataclass
-from tkinter import messagebox, ttk
+#!/usr/bin/env python3
+"""NMEA2000 simulator served with Flask and SocketCAN.
 
-USBCAN_II = 4
-DEFAULT_DEVICE_TYPE = USBCAN_II
-DEFAULT_DEVICE_INDEX = 0
-DEFAULT_CAN_INDEX = 0
-DEFAULT_DLL_NAME = "ECanVci.dll"
-TIMING0_250K = 0x01
-TIMING1_250K = 0x1C
+This application provides a browser UI (http://<host>:8080) to configure and send
+NMEA2000 frames over Linux SocketCAN interfaces. It supports selecting interface
+index 0 or 1, one-shot transmission, periodic transmission, and binary switch
+command/status behavior similar to the old desktop application.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import can
+from flask import Flask, redirect, render_template_string, request, url_for
+
+DEFAULT_CAN_INTERFACE_INDEX = 0
+CAN_INTERFACE_MAP = {0: "awlink0", 1: "awlink1"}
+DEFAULT_BITRATE = 250000
 
 # Core NMEA2000 / ISO11783 PGNs used by this simulator.
 PGN_ISO_REQUEST = 59904
@@ -28,16 +37,6 @@ DEFAULT_PRIORITY = 6
 
 
 @dataclass
-class DeviceConfig:
-    dll_path: str
-    device_type: int
-    device_index: int
-    can_index: int
-    timing0: int
-    timing1: int
-
-
-@dataclass
 class ProtocolMessage:
     pgn: int
     data: bytes
@@ -46,103 +45,102 @@ class ProtocolMessage:
     source_address: int | None = None
 
 
-class CAN_OBJ(ctypes.Structure):
-    _fields_ = [
-        ("ID", ctypes.c_uint),
-        ("TimeStamp", ctypes.c_uint),
-        ("TimeFlag", ctypes.c_ubyte),
-        ("SendType", ctypes.c_ubyte),
-        ("RemoteFlag", ctypes.c_ubyte),
-        ("ExternFlag", ctypes.c_ubyte),
-        ("DataLen", ctypes.c_ubyte),
-        ("Data", ctypes.c_ubyte * 8),
-        ("Reserved", ctypes.c_ubyte * 3),
-    ]
+@dataclass
+class SimulatorConfig:
+    can_interface_index: int = DEFAULT_CAN_INTERFACE_INDEX
+    bitrate: int = DEFAULT_BITRATE
+    source_address: int = 0
+    destination_address: int = 255
+    engine_instance: int = 0
+    device_name: int = 0x1F2000123456789A
+
+    engine_speed_rpm: float = 750.0
+    engine_boost_bar: float = 1.0
+    trim_percent: float = 0.0
+    oil_pressure_bar: float = 3.5
+    oil_temp_c: float = 85.0
+    coolant_temp_c: float = 78.0
+    alternator_v: float = 13.8
+    fuel_rate_lph: float = 12.0
+    engine_hours_h: float = 500.0
+    coolant_pressure_bar: float = 1.2
+    fuel_pressure_psi: float = 43.5
+    engine_load_percent: float = 35.0
+    engine_torque_percent: float = 42.0
+    iso_request_pgn: int = PGN_ADDRESS_CLAIM
+
+    product_model: str = "GCAN Engine Sim"
+    software_version: str = "1.0.0"
+    model_version: str = "1.0"
+    serial_code: str = "SIM-0001"
+
+    switch_node_source_address: int = 100
+    switch_node_device_name: int = 0x1F2000AA12345678
+    switch_manufacturer_code: int = 176
+    switch_product_model: str = "CKM12"
+    switch_software_version: str = "2.02.08"
+    switch_model_version: str = "Rev A"
+    switch_serial_code: str = "1606029"
+
+    interval_ms: int = 100
+    binary_switch_bank_instance: int = 52
+
+    address_claim_enabled: bool = True
+    iso_request_enabled: bool = True
+    product_info_enabled: bool = True
+    heartbeat_enabled: bool = True
+    engine_rapid_enabled: bool = True
+    engine_dynamic_enabled: bool = True
+    switch_address_claim_enabled: bool = True
+    switch_product_info_enabled: bool = True
+    switch_heartbeat_enabled: bool = True
+    binary_switch_status_enabled: bool = True
+
+    binary_switch_states: list[bool] = field(default_factory=lambda: [False] * 12)
 
 
-class INIT_CONFIG(ctypes.Structure):
-    _fields_ = [
-        ("AccCode", ctypes.c_uint),
-        ("AccMask", ctypes.c_uint),
-        ("Reserved", ctypes.c_uint),
-        ("Filter", ctypes.c_ubyte),
-        ("Timing0", ctypes.c_ubyte),
-        ("Timing1", ctypes.c_ubyte),
-        ("Mode", ctypes.c_ubyte),
-    ]
+class SocketCANDevice:
+    """SocketCAN transport with interface setup/teardown helpers."""
+
+    def __init__(self) -> None:
+        self.bus: can.BusABC | None = None
+        self.interface: str | None = None
+
+    @staticmethod
+    def _run_cmd(cmd: list[str], check: bool = True) -> None:
+        subprocess.run(cmd, check=check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def connect(self, interface: str, bitrate: int) -> None:
+        self.disconnect(set_down=False)
+
+        # Reset + set bitrate then bring interface up.
+        self._run_cmd(["ip", "link", "set", interface, "down"], check=False)
+        self._run_cmd(["ip", "link", "set", interface, "type", "can", "bitrate", str(bitrate)], check=False)
+        self._run_cmd(["ip", "link", "set", interface, "up"], check=True)
+
+        self.bus = can.Bus(interface="socketcan", channel=interface)
+        self.interface = interface
+
+    def disconnect(self, set_down: bool = True) -> None:
+        if self.bus is not None:
+            try:
+                self.bus.shutdown()
+            except Exception:
+                pass
+            self.bus = None
+
+        if set_down and self.interface:
+            self._run_cmd(["ip", "link", "set", self.interface, "down"], check=False)
+        self.interface = None
+
+    def send(self, frame_id: int, data: bytes) -> None:
+        if not self.bus:
+            raise RuntimeError("SocketCAN bus not connected")
+        msg = can.Message(arbitration_id=frame_id, data=data, is_extended_id=True)
+        self.bus.send(msg)
 
 
-class USBCANDevice:
-    def __init__(self, config: DeviceConfig) -> None:
-        self.config = config
-        self.dll = ctypes.WinDLL(config.dll_path)
-        self._bind_functions()
-
-    def _bind_functions(self) -> None:
-        self.dll.OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.OpenDevice.restype = ctypes.c_uint
-        self.dll.CloseDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
-        self.dll.CloseDevice.restype = ctypes.c_uint
-        self.dll.InitCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(INIT_CONFIG)]
-        self.dll.InitCAN.restype = ctypes.c_uint
-        self.dll.StartCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.StartCAN.restype = ctypes.c_uint
-        self.dll.Transmit.argtypes = [
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.POINTER(CAN_OBJ),
-            ctypes.c_ulong,
-        ]
-        self.dll.Transmit.restype = ctypes.c_ulong
-
-    def open(self) -> None:
-        result = self.dll.OpenDevice(self.config.device_type, self.config.device_index, 0)
-        if result == 0:
-            raise RuntimeError("OpenDevice failed.")
-        init_config = INIT_CONFIG(
-            AccCode=0,
-            AccMask=0xFFFFFFFF,
-            Reserved=0,
-            Filter=0,
-            Timing0=self.config.timing0,
-            Timing1=self.config.timing1,
-            Mode=0,
-        )
-        if self.dll.InitCAN(
-            self.config.device_type,
-            self.config.device_index,
-            self.config.can_index,
-            ctypes.byref(init_config),
-        ) == 0:
-            raise RuntimeError("InitCAN failed.")
-        if self.dll.StartCAN(self.config.device_type, self.config.device_index, self.config.can_index) == 0:
-            raise RuntimeError("StartCAN failed.")
-
-    def close(self) -> None:
-        self.dll.CloseDevice(self.config.device_type, self.config.device_index)
-
-    def send(self, frame_id: int, data: bytes) -> int:
-        can_obj = CAN_OBJ()
-        can_obj.ID = frame_id
-        can_obj.TimeStamp = 0
-        can_obj.TimeFlag = 0
-        can_obj.SendType = 0
-        can_obj.RemoteFlag = 0
-        can_obj.ExternFlag = 1
-        can_obj.DataLen = len(data)
-        for index, value in enumerate(data):
-            can_obj.Data[index] = value
-        return int(
-            self.dll.Transmit(
-                self.config.device_type,
-                self.config.device_index,
-                self.config.can_index,
-                ctypes.byref(can_obj),
-                1,
-            )
-        )
-
+# ===== Protocol utility functions =====
 
 def nmea2000_id(priority: int, pgn: int, source_address: int, destination: int = GLOBAL_DESTINATION) -> int:
     pf = (pgn >> 8) & 0xFF
@@ -175,7 +173,6 @@ def build_address_claim(name: int) -> bytes:
 
 
 def set_name_manufacturer_code(name: int, manufacturer_code: int) -> int:
-    # NMEA2000 NAME manufacturer code occupies 11 bits at bit position 21.
     code = max(0, min(0x7FF, int(manufacturer_code)))
     mask = 0x7FF << 21
     return (name & ~mask) | (code << 21)
@@ -186,12 +183,10 @@ def build_iso_request(requested_pgn: int) -> bytes:
 
 
 def build_engine_rapid(engine_instance: int, engine_speed_rpm: float, engine_boost_bar: float, trim_percent: float) -> bytes:
-    # PGN 127488 per NMEA2000: speed=0.25 rpm/bit, boost=100 Pa/bit, trim=1 %/bit (int8)
     speed_raw = clamp_u16(engine_speed_rpm, 0.25)
     boost_pa = engine_boost_bar * 100000.0
     boost_raw = clamp_u16(boost_pa, 100.0)
     trim_raw = max(-125, min(125, int(round(trim_percent))))
-    trim_encoded = trim_raw & 0xFF
     return bytes(
         (
             engine_instance & 0xFF,
@@ -199,7 +194,7 @@ def build_engine_rapid(engine_instance: int, engine_speed_rpm: float, engine_boo
             (speed_raw >> 8) & 0xFF,
             boost_raw & 0xFF,
             (boost_raw >> 8) & 0xFF,
-            trim_encoded,
+            trim_raw & 0xFF,
             0xFF,
             0xFF,
         )
@@ -219,10 +214,6 @@ def build_engine_dynamic(
     engine_load_percent: float,
     engine_torque_percent: float,
 ) -> bytes:
-    # PGN 127489 per NMEA2000:
-    # Oil/Coolant pressure: 100 Pa/bit, Fuel pressure: 1000 Pa/bit
-    # Oil temp: 0.1 K/bit, Coolant temp: 0.01 K/bit
-    # Alternator: 0.01 V/bit, Fuel rate: 0.1 L/h/bit
     oil_p_raw = clamp_u16(oil_pressure_bar * 100000.0, 100.0)
     oil_t_raw = clamp_u16(oil_temp_c + 273.15, 0.1)
     coolant_t_raw = clamp_u16(coolant_temp_c + 273.15, 0.01)
@@ -244,9 +235,6 @@ def build_engine_dynamic(
     data.extend(hours_raw.to_bytes(4, byteorder="little", signed=False))
     data.extend(le_u16(coolant_p_raw))
     data.extend(le_u16(fuel_p_raw))
-    # Byte layout after fuel pressure is:
-    # Reserved (1), Engine Discrete Status 1 (2), Engine Discrete Status 2 (2),
-    # Percent Engine Load (1), Percent Engine Torque (1)
     data.extend((0xFF,))
     data.extend(le_u16(0xFFFF))
     data.extend(le_u16(0xFFFF))
@@ -255,7 +243,6 @@ def build_engine_dynamic(
 
 
 def build_product_info_payload(model_id: str, software_version: str, model_version: str, serial_code: str) -> bytes:
-    # Simplified NMEA2000 Product Information payload (fast packet).
     model = model_id[:32].ljust(32, "\x00").encode("ascii", errors="ignore")
     software = software_version[:32].ljust(32, "\x00").encode("ascii", errors="ignore")
     version = model_version[:32].ljust(32, "\x00").encode("ascii", errors="ignore")
@@ -268,11 +255,7 @@ def build_product_info_payload(model_id: str, software_version: str, model_versi
 
 
 def build_heartbeat_payload(interval_ms: int, sequence_counter: int) -> bytes:
-    return (
-        int(max(0, min(0xFFFF, interval_ms))).to_bytes(2, byteorder="little", signed=False)
-        + bytes((sequence_counter & 0xFF,))
-        + bytes((0xFF,) * 5)
-    )
+    return int(max(0, min(0xFFFF, interval_ms))).to_bytes(2, byteorder="little", signed=False) + bytes((sequence_counter & 0xFF,)) + bytes((0xFF,) * 5)
 
 
 def _pack_2bit_values(values: list[int], output_len: int) -> bytes:
@@ -288,8 +271,6 @@ def _pack_2bit_values(values: list[int], output_len: int) -> bytes:
 
 
 def build_binary_switch_bank_status(bank_instance: int, switch_states: list[bool]) -> bytes:
-    # PGN 127501: 1 byte bank instance + 28 x 2-bit switch status fields.
-    # Status encoding used here: 0=Off, 1=On, 3=Unavailable.
     states_2bit = [(1 if state else 0) for state in switch_states[:12]]
     if len(states_2bit) < 28:
         states_2bit.extend([3] * (28 - len(states_2bit)))
@@ -298,8 +279,6 @@ def build_binary_switch_bank_status(bank_instance: int, switch_states: list[bool
 
 
 def build_group_function_binary_switch_command(bank_instance: int, switch_number: int, state_on: bool) -> bytes:
-    # Simplified PGN 126208 (Command Group Function) command payload:
-    # [FunctionCode=1, PGN(127501), NumberOfParams=3, BankInstance, SwitchNumber(1..12), Status(0/1)]
     return bytes(
         (
             1,
@@ -322,456 +301,143 @@ def split_fast_packet(payload: bytes, sequence_id: int) -> list[bytes]:
     cursor = 0
     frames: list[bytes] = []
 
-    first_room = 6
-    first_chunk = payload[cursor : cursor + first_room]
+    first_chunk = payload[cursor : cursor + 6]
     cursor += len(first_chunk)
-    first_frame = bytes(((sid << 5) | frame_index, len(payload))) + first_chunk
-    frames.append(first_frame)
+    frames.append(bytes(((sid << 5) | frame_index, len(payload))) + first_chunk)
     frame_index += 1
 
     while cursor < len(payload):
         chunk = payload[cursor : cursor + 7]
         cursor += len(chunk)
-        frame = bytes((((sid << 5) | frame_index),)) + chunk
-        frames.append(frame)
+        frames.append(bytes((((sid << 5) | frame_index),)) + chunk)
         frame_index += 1
     return frames
 
 
-class SimulatorApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("NMEA2000 Engine Simulator (USB GCAN)")
-        self.device: USBCANDevice | None = None
-        self.send_job: str | None = None
-        self.is_connected = False
+class SimulatorService:
+    def __init__(self) -> None:
+        self.config = SimulatorConfig()
+        self.device = SocketCANDevice()
+        self.lock = threading.Lock()
         self.fast_packet_sequence = 0
         self.engine_heartbeat_sequence = 0
         self.switch_heartbeat_sequence = 0
-        self.binary_switch_states = [False] * 12
-        self.switch_buttons: list[ttk.Button] = []
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=10)
-        main.grid(sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main.columnconfigure(1, weight=1)
-
-        self.status_text = tk.StringVar(value="Status: Disconnected")
-        ttk.Label(main, textvariable=self.status_text).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
-
-        ttk.Label(main, text="DLL path").grid(row=1, column=0, sticky="w")
-        self.dll_path = tk.StringVar(value=DEFAULT_DLL_NAME)
-        ttk.Entry(main, textvariable=self.dll_path).grid(row=1, column=1, columnspan=3, sticky="ew")
-
-        ttk.Label(main, text="Source address").grid(row=2, column=0, sticky="w")
-        self.source_address = tk.StringVar(value="0")
-        ttk.Entry(main, textvariable=self.source_address).grid(row=2, column=1, sticky="ew")
-
-        ttk.Label(main, text="Destination").grid(row=2, column=2, sticky="w")
-        self.destination_address = tk.StringVar(value="255")
-        ttk.Entry(main, textvariable=self.destination_address).grid(row=2, column=3, sticky="ew")
-
-        ttk.Label(main, text="Engine instance").grid(row=3, column=0, sticky="w")
-        self.engine_instance = tk.StringVar(value="0")
-        ttk.Entry(main, textvariable=self.engine_instance).grid(row=3, column=1, sticky="ew")
-
-        ttk.Label(main, text="Device NAME (hex)").grid(row=3, column=2, sticky="w")
-        self.device_name = tk.StringVar(value="0x1F2000123456789A")
-        ttk.Entry(main, textvariable=self.device_name).grid(row=3, column=3, sticky="ew")
-
-        row = 4
-        self.engine_speed_rpm = self._add_field(main, row, "Engine speed rpm", "750")
-        self.engine_boost_bar = self._add_field(main, row, "Boost pressure bar", "1.0", col=2)
-        row += 1
-        self.trim_percent = self._add_field(main, row, "Engine trim %", "0")
-        self.oil_pressure_bar = self._add_field(main, row, "Oil pressure bar", "3.5", col=2)
-        row += 1
-        self.oil_temp_c = self._add_field(main, row, "Oil temp °C", "85")
-        self.coolant_temp_c = self._add_field(main, row, "Coolant temp °C", "78", col=2)
-        row += 1
-        self.alternator_v = self._add_field(main, row, "Alternator V", "13.8")
-        self.fuel_rate_lph = self._add_field(main, row, "Fuel rate L/h", "12", col=2)
-        row += 1
-        self.engine_hours_h = self._add_field(main, row, "Engine hours", "500")
-        self.coolant_pressure_bar = self._add_field(main, row, "Coolant pressure bar", "1.2", col=2)
-        row += 1
-        self.fuel_pressure_psi = self._add_field(main, row, "Fuel pressure PSI", "43.5")
-        self.engine_load_percent = self._add_field(main, row, "Engine load %", "35", col=2)
-        row += 1
-        self.engine_torque_percent = self._add_field(main, row, "Engine torque %", "42")
-        self.iso_request_pgn = self._add_field(main, row, "ISO request PGN", str(PGN_ADDRESS_CLAIM), col=2)
-        row += 1
-
-        ttk.Label(main, text="Product model").grid(row=row, column=0, sticky="w")
-        self.product_model = tk.StringVar(value="GCAN Engine Sim")
-        ttk.Entry(main, textvariable=self.product_model).grid(row=row, column=1, sticky="ew")
-        ttk.Label(main, text="Software version").grid(row=row, column=2, sticky="w")
-        self.software_version = tk.StringVar(value="1.0.0")
-        ttk.Entry(main, textvariable=self.software_version).grid(row=row, column=3, sticky="ew")
-        row += 1
-
-        ttk.Label(main, text="Model version").grid(row=row, column=0, sticky="w")
-        self.model_version = tk.StringVar(value="1.0")
-        ttk.Entry(main, textvariable=self.model_version).grid(row=row, column=1, sticky="ew")
-        ttk.Label(main, text="Serial code").grid(row=row, column=2, sticky="w")
-        self.serial_code = tk.StringVar(value="SIM-0001")
-        ttk.Entry(main, textvariable=self.serial_code).grid(row=row, column=3, sticky="ew")
-
-        row += 1
-        ttk.Label(main, text="Interval ms").grid(row=row, column=2, sticky="w")
-        self.interval_ms = tk.IntVar(value=100)
-        ttk.Entry(main, textvariable=self.interval_ms).grid(row=row, column=3, sticky="ew")
-        row += 1
-
-        switch_node = ttk.LabelFrame(main, text="Virtual switch node identity (2nd device)", padding=8)
-        switch_node.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(2, 6))
-        ttk.Label(switch_node, text="Switch node source").grid(row=0, column=0, sticky="w")
-        self.switch_node_source_address = tk.StringVar(value="100")
-        ttk.Entry(switch_node, textvariable=self.switch_node_source_address, width=10).grid(row=0, column=1, sticky="w")
-        ttk.Label(switch_node, text="Switch node NAME (hex)").grid(row=0, column=2, sticky="w")
-        self.switch_node_device_name = tk.StringVar(value="0x1F2000AA12345678")
-        ttk.Entry(switch_node, textvariable=self.switch_node_device_name).grid(row=0, column=3, sticky="ew")
-        ttk.Label(switch_node, text="Switch manufacturer code").grid(row=1, column=0, sticky="w")
-        self.switch_manufacturer_code = tk.StringVar(value="176")
-        ttk.Entry(switch_node, textvariable=self.switch_manufacturer_code, width=10).grid(row=1, column=1, sticky="w")
-
-        ttk.Label(switch_node, text="Switch model").grid(row=1, column=2, sticky="w")
-        self.switch_product_model = tk.StringVar(value="CKM12")
-        ttk.Entry(switch_node, textvariable=self.switch_product_model, width=18).grid(row=1, column=3, sticky="ew")
-        ttk.Label(switch_node, text="Switch software").grid(row=2, column=0, sticky="w")
-        self.switch_software_version = tk.StringVar(value="2.02.08")
-        ttk.Entry(switch_node, textvariable=self.switch_software_version, width=18).grid(row=2, column=1, sticky="ew")
-
-        ttk.Label(switch_node, text="Switch model version").grid(row=2, column=2, sticky="w")
-        self.switch_model_version = tk.StringVar(value="Rev A")
-        ttk.Entry(switch_node, textvariable=self.switch_model_version, width=18).grid(row=2, column=3, sticky="ew")
-        ttk.Label(switch_node, text="Switch serial").grid(row=3, column=0, sticky="w")
-        self.switch_serial_code = tk.StringVar(value="1606029")
-        ttk.Entry(switch_node, textvariable=self.switch_serial_code, width=18).grid(row=3, column=1, sticky="ew")
-        row += 1
-
-        enabled = ttk.LabelFrame(main, text="Enabled messages", padding=8)
-        enabled.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 6))
-        self.address_claim_enabled = tk.BooleanVar(value=True)
-        self.iso_request_enabled = tk.BooleanVar(value=True)
-        self.product_info_enabled = tk.BooleanVar(value=True)
-        self.heartbeat_enabled = tk.BooleanVar(value=True)
-        self.engine_rapid_enabled = tk.BooleanVar(value=True)
-        self.engine_dynamic_enabled = tk.BooleanVar(value=True)
-        self.switch_address_claim_enabled = tk.BooleanVar(value=True)
-        self.switch_product_info_enabled = tk.BooleanVar(value=True)
-        self.switch_heartbeat_enabled = tk.BooleanVar(value=True)
-        self.binary_switch_status_enabled = tk.BooleanVar(value=True)
-        ttk.Checkbutton(enabled, text="ISO Address Claim", variable=self.address_claim_enabled).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(enabled, text="ISO Request", variable=self.iso_request_enabled).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(enabled, text="Product Info", variable=self.product_info_enabled).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(enabled, text="Heartbeat", variable=self.heartbeat_enabled).grid(row=1, column=1, sticky="w")
-        ttk.Checkbutton(enabled, text="Engine Rapid PGN 127488", variable=self.engine_rapid_enabled).grid(row=2, column=0, sticky="w")
-        ttk.Checkbutton(enabled, text="Engine Dynamic PGN 127489", variable=self.engine_dynamic_enabled).grid(row=2, column=1, sticky="w")
-        ttk.Checkbutton(enabled, text="Switch node Address Claim", variable=self.switch_address_claim_enabled).grid(
-            row=3, column=0, sticky="w"
-        )
-        ttk.Checkbutton(enabled, text="Switch node Product Info", variable=self.switch_product_info_enabled).grid(
-            row=3, column=1, sticky="w"
-        )
-        ttk.Checkbutton(enabled, text="Switch node Heartbeat", variable=self.switch_heartbeat_enabled).grid(
-            row=4, column=0, sticky="w"
-        )
-        ttk.Checkbutton(
-            enabled, text="Binary Switch Bank Status PGN 127501", variable=self.binary_switch_status_enabled
-        ).grid(row=4, column=1, columnspan=2, sticky="w")
-        row += 1
-
-        switch_frame = ttk.LabelFrame(main, text="Binary Switch Bank (1-12 pushbuttons)", padding=8)
-        switch_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(4, 6))
-        ttk.Label(switch_frame, text="Bank instance").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        self.binary_switch_bank_instance = tk.StringVar(value="52")
-        ttk.Entry(switch_frame, textvariable=self.binary_switch_bank_instance, width=8).grid(row=0, column=1, sticky="w")
-        ttk.Label(switch_frame, text="Write with PGN 126208 on button press").grid(row=0, column=2, columnspan=4, sticky="w")
-        for index in range(12):
-            button = ttk.Button(
-                switch_frame,
-                text=f"SW {index + 1}: RELEASED",
-                width=12,
-            )
-            button.bind("<ButtonPress-1>", lambda _event, switch_no=index + 1: self.on_switch_press(switch_no))
-            button.bind("<ButtonRelease-1>", lambda _event, switch_no=index + 1: self.on_switch_release(switch_no))
-            button.grid(row=1 + (index // 6), column=index % 6, padx=2, pady=2, sticky="ew")
-            self.switch_buttons.append(button)
-        row += 1
-
-        buttons = ttk.Frame(main)
-        buttons.grid(row=row, column=0, columnspan=4, pady=8, sticky="ew")
-        self.connect_button = ttk.Button(buttons, text="Connect", command=self.connect)
-        self.connect_button.grid(row=0, column=0, padx=4)
-        self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self.disconnect)
-        self.disconnect_button.grid(row=0, column=1, padx=4)
-        self.send_once_button = ttk.Button(buttons, text="Send Once", command=self.send_once)
-        self.send_once_button.grid(row=0, column=2, padx=4)
-        self.start_button = ttk.Button(buttons, text="Start Periodic", command=self.start_periodic)
-        self.start_button.grid(row=0, column=3, padx=4)
-        self.stop_button = ttk.Button(buttons, text="Stop Periodic", command=self.stop_periodic)
-        self.stop_button.grid(row=0, column=4, padx=4)
-
-        self._update_button_states()
-        self._refresh_switch_button_labels()
-
-    def _add_field(self, parent: ttk.Frame, row: int, label: str, default: str, col: int = 0) -> tk.StringVar:
-        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w")
-        value = tk.StringVar(value=default)
-        ttk.Entry(parent, textvariable=value).grid(row=row, column=col + 1, sticky="ew")
-        return value
-
-    def _as_int(self, value: str, default: int = 0) -> int:
-        try:
-            if value.strip().lower().startswith("0x"):
-                return int(value.strip(), 16)
-            return int(float(value.strip()))
-        except ValueError:
-            return default
-
-    def _as_float(self, value: str, default: float = 0.0) -> float:
-        try:
-            return float(value.strip())
-        except ValueError:
-            return default
+        self.connected = False
+        self.periodic_running = False
+        self.periodic_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.status = "Disconnected"
 
     def _source_address(self) -> int:
-        return max(0, min(251, self._as_int(self.source_address.get(), 0)))
+        return max(0, min(251, self.config.source_address))
 
     def _switch_source_address(self) -> int:
-        return max(0, min(251, self._as_int(self.switch_node_source_address.get(), 100)))
+        return max(0, min(251, self.config.switch_node_source_address))
 
     def _destination(self) -> int:
-        return max(0, min(255, self._as_int(self.destination_address.get(), 255)))
-
-    def _device_name(self) -> int:
-        value = self.device_name.get().strip()
-        try:
-            return int(value, 16) if value.lower().startswith("0x") else int(value)
-        except ValueError:
-            return 0x1F2000123456789A
+        return max(0, min(255, self.config.destination_address))
 
     def _switch_device_name(self) -> int:
-        value = self.switch_node_device_name.get().strip()
-        try:
-            name = int(value, 16) if value.lower().startswith("0x") else int(value)
-        except ValueError:
-            name = 0x1F2000AA12345678
-        manufacturer = self._as_int(self.switch_manufacturer_code.get(), 176)
-        return set_name_manufacturer_code(name, manufacturer)
+        return set_name_manufacturer_code(self.config.switch_node_device_name, self.config.switch_manufacturer_code)
 
     def _binary_switch_bank_instance(self) -> int:
-        return max(0, min(255, self._as_int(self.binary_switch_bank_instance.get(), 52)))
-
-    def _refresh_switch_button_labels(self) -> None:
-        for index, button in enumerate(self.switch_buttons, start=1):
-            state_text = "PRESSED" if self.binary_switch_states[index - 1] else "RELEASED"
-            button.configure(text=f"SW {index}: {state_text}")
-
-    def _send_switch_command(self, switch_number: int, state_on: bool) -> None:
-        if not self.device:
-            return
-        payload = build_group_function_binary_switch_command(
-            self._binary_switch_bank_instance(),
-            switch_number,
-            state_on,
-        )
-        frame_id = nmea2000_id(DEFAULT_PRIORITY, PGN_GROUP_FUNCTION, self._source_address(), self._destination())
-        self.device.send(frame_id, payload)
-
-    def on_switch_press(self, switch_number: int) -> None:
-        switch_index = max(1, min(12, switch_number)) - 1
-        if self.binary_switch_states[switch_index]:
-            return
-        self.binary_switch_states[switch_index] = True
-        self._refresh_switch_button_labels()
-        self._send_switch_command(switch_number, True)
-
-    def on_switch_release(self, switch_number: int) -> None:
-        switch_index = max(1, min(12, switch_number)) - 1
-        if not self.binary_switch_states[switch_index]:
-            return
-        self.binary_switch_states[switch_index] = False
-        self._refresh_switch_button_labels()
-        self._send_switch_command(switch_number, False)
-
-    def resolve_dll_path(self) -> str:
-        path = self.dll_path.get().strip() or DEFAULT_DLL_NAME
-        return os.path.abspath(path)
+        return max(0, min(255, self.config.binary_switch_bank_instance))
 
     def connect(self) -> None:
-        if platform.system() != "Windows":
-            messagebox.showerror("Unsupported OS", "This simulator requires Windows because it loads ECanVci.dll.")
-            return
-        try:
-            config = DeviceConfig(
-                dll_path=self.resolve_dll_path(),
-                device_type=DEFAULT_DEVICE_TYPE,
-                device_index=DEFAULT_DEVICE_INDEX,
-                can_index=DEFAULT_CAN_INDEX,
-                timing0=TIMING0_250K,
-                timing1=TIMING1_250K,
-            )
-            self.device = USBCANDevice(config)
-            self.device.open()
-            self.is_connected = True
-            self.status_text.set(f"Status: Connected ({config.dll_path})")
-            self.send_once()
-        except Exception as exc:
-            self.device = None
-            self.is_connected = False
-            messagebox.showerror("Connection error", str(exc))
-        self._update_button_states()
+        idx = 0 if self.config.can_interface_index not in CAN_INTERFACE_MAP else self.config.can_interface_index
+        interface = CAN_INTERFACE_MAP[idx]
+        self.device.connect(interface, self.config.bitrate)
+        self.connected = True
+        self.status = f"Connected to {interface} @ {self.config.bitrate} bps"
 
     def disconnect(self) -> None:
         self.stop_periodic()
-        if self.device:
-            try:
-                self.device.close()
-            except Exception:
-                pass
-        self.device = None
-        self.is_connected = False
-        self.status_text.set("Status: Disconnected")
-        self._update_button_states()
-
-    def _send_protocol_messages(self) -> None:
-        if not self.device:
-            return
-        for frame_id, data in self.current_frames():
-            self.device.send(frame_id, data)
-
-    def send_once(self) -> None:
-        self._send_protocol_messages()
-
-    def start_periodic(self) -> None:
-        if not self.device or self.send_job is not None:
-            return
-        self._schedule_send()
-        self._update_button_states()
-
-    def stop_periodic(self) -> None:
-        if self.send_job is not None:
-            self.root.after_cancel(self.send_job)
-            self.send_job = None
-        self._update_button_states()
-
-    def _schedule_send(self) -> None:
-        try:
-            interval = max(10, int(self.interval_ms.get()))
-        except tk.TclError:
-            interval = 100
-        self.send_job = self.root.after(interval, self._send_and_reschedule)
-
-    def _send_and_reschedule(self) -> None:
-        self._send_protocol_messages()
-        self._schedule_send()
-
-    def _expand_protocol_message(self, message: ProtocolMessage) -> list[tuple[int, bytes]]:
-        source = self._source_address() if message.source_address is None else message.source_address
-        if len(message.data) <= 8:
-            frame_id = nmea2000_id(message.priority, message.pgn, source, message.destination)
-            return [(frame_id, message.data)]
-
-        frames = split_fast_packet(message.data, self.fast_packet_sequence)
-        self.fast_packet_sequence = (self.fast_packet_sequence + 1) & 0x07
-        frame_id = nmea2000_id(message.priority, message.pgn, source, message.destination)
-        return [(frame_id, frame.ljust(8, b"\xFF")) for frame in frames]
+        self.device.disconnect(set_down=True)
+        self.connected = False
+        self.status = "Disconnected"
 
     def current_messages(self) -> list[ProtocolMessage]:
+        cfg = self.config
         destination = self._destination()
-        engine_instance = max(0, min(255, self._as_int(self.engine_instance.get(), 0)))
+        engine_instance = max(0, min(255, cfg.engine_instance))
 
         messages: list[ProtocolMessage] = []
-        if self.address_claim_enabled.get():
-            messages.append(
-                ProtocolMessage(PGN_ADDRESS_CLAIM, build_address_claim(self._device_name()), 6, GLOBAL_DESTINATION, self._source_address())
-            )
-        if self.iso_request_enabled.get():
-            request_pgn = max(0, min(0x3FFFF, self._as_int(self.iso_request_pgn.get(), PGN_ADDRESS_CLAIM)))
+        if cfg.address_claim_enabled:
+            messages.append(ProtocolMessage(PGN_ADDRESS_CLAIM, build_address_claim(cfg.device_name), 6, GLOBAL_DESTINATION, self._source_address()))
+        if cfg.iso_request_enabled:
+            request_pgn = max(0, min(0x3FFFF, cfg.iso_request_pgn))
             messages.append(ProtocolMessage(PGN_ISO_REQUEST, build_iso_request(request_pgn), 6, destination))
-        if self.product_info_enabled.get():
-            payload = build_product_info_payload(
-                self.product_model.get(),
-                self.software_version.get(),
-                self.model_version.get(),
-                self.serial_code.get(),
+        if cfg.product_info_enabled:
+            messages.append(
+                ProtocolMessage(
+                    PGN_PRODUCT_INFO,
+                    build_product_info_payload(cfg.product_model, cfg.software_version, cfg.model_version, cfg.serial_code),
+                    6,
+                    GLOBAL_DESTINATION,
+                )
             )
-            messages.append(ProtocolMessage(PGN_PRODUCT_INFO, payload, 6, GLOBAL_DESTINATION))
-        if self.heartbeat_enabled.get():
-            heartbeat_interval = max(0, self._as_int(str(self.interval_ms.get()), 100))
-            payload = build_heartbeat_payload(heartbeat_interval, self.engine_heartbeat_sequence)
+        if cfg.heartbeat_enabled:
+            payload = build_heartbeat_payload(max(0, cfg.interval_ms), self.engine_heartbeat_sequence)
             self.engine_heartbeat_sequence = (self.engine_heartbeat_sequence + 1) & 0xFF
             messages.append(ProtocolMessage(PGN_HEARTBEAT, payload, 7, GLOBAL_DESTINATION, self._source_address()))
-        if self.engine_rapid_enabled.get():
+        if cfg.engine_rapid_enabled:
             messages.append(
                 ProtocolMessage(
                     PGN_ENGINE_RAPID,
-                    build_engine_rapid(
-                        engine_instance,
-                        self._as_float(self.engine_speed_rpm.get(), 0.0),
-                        self._as_float(self.engine_boost_bar.get(), 1.0),
-                        self._as_float(self.trim_percent.get(), 0.0),
-                    ),
+                    build_engine_rapid(engine_instance, cfg.engine_speed_rpm, cfg.engine_boost_bar, cfg.trim_percent),
                     2,
                     GLOBAL_DESTINATION,
                     self._source_address(),
                 )
             )
-        if self.engine_dynamic_enabled.get():
+        if cfg.engine_dynamic_enabled:
             messages.append(
                 ProtocolMessage(
                     PGN_ENGINE_DYNAMIC,
                     build_engine_dynamic(
                         engine_instance,
-                        self._as_float(self.oil_pressure_bar.get(), 0.0),
-                        self._as_float(self.oil_temp_c.get(), 0.0),
-                        self._as_float(self.coolant_temp_c.get(), 0.0),
-                        self._as_float(self.alternator_v.get(), 0.0),
-                        self._as_float(self.fuel_rate_lph.get(), 0.0),
-                        self._as_float(self.engine_hours_h.get(), 0.0),
-                        self._as_float(self.coolant_pressure_bar.get(), 0.0),
-                        self._as_float(self.fuel_pressure_psi.get(), 0.0) * 0.0689476,
-                        self._as_float(self.engine_load_percent.get(), 0.0),
-                        self._as_float(self.engine_torque_percent.get(), 0.0),
+                        cfg.oil_pressure_bar,
+                        cfg.oil_temp_c,
+                        cfg.coolant_temp_c,
+                        cfg.alternator_v,
+                        cfg.fuel_rate_lph,
+                        cfg.engine_hours_h,
+                        cfg.coolant_pressure_bar,
+                        cfg.fuel_pressure_psi * 0.0689476,
+                        cfg.engine_load_percent,
+                        cfg.engine_torque_percent,
                     ),
                     2,
                     GLOBAL_DESTINATION,
                     self._source_address(),
                 )
             )
-        if self.switch_address_claim_enabled.get():
+        if cfg.switch_address_claim_enabled:
+            messages.append(ProtocolMessage(PGN_ADDRESS_CLAIM, build_address_claim(self._switch_device_name()), 6, GLOBAL_DESTINATION, self._switch_source_address()))
+        if cfg.switch_product_info_enabled:
             messages.append(
                 ProtocolMessage(
-                    PGN_ADDRESS_CLAIM,
-                    build_address_claim(self._switch_device_name()),
+                    PGN_PRODUCT_INFO,
+                    build_product_info_payload(
+                        cfg.switch_product_model,
+                        cfg.switch_software_version,
+                        cfg.switch_model_version,
+                        cfg.switch_serial_code,
+                    ),
                     6,
                     GLOBAL_DESTINATION,
                     self._switch_source_address(),
                 )
             )
-        if self.switch_product_info_enabled.get():
-            payload = build_product_info_payload(
-                self.switch_product_model.get(),
-                self.switch_software_version.get(),
-                self.switch_model_version.get(),
-                self.switch_serial_code.get(),
-            )
-            messages.append(ProtocolMessage(PGN_PRODUCT_INFO, payload, 6, GLOBAL_DESTINATION, self._switch_source_address()))
-        if self.switch_heartbeat_enabled.get():
-            heartbeat_interval = max(0, self._as_int(str(self.interval_ms.get()), 100))
-            payload = build_heartbeat_payload(heartbeat_interval, self.switch_heartbeat_sequence)
+        if cfg.switch_heartbeat_enabled:
+            payload = build_heartbeat_payload(max(0, cfg.interval_ms), self.switch_heartbeat_sequence)
             self.switch_heartbeat_sequence = (self.switch_heartbeat_sequence + 1) & 0xFF
             messages.append(ProtocolMessage(PGN_HEARTBEAT, payload, 7, GLOBAL_DESTINATION, self._switch_source_address()))
-        if self.binary_switch_status_enabled.get():
+        if cfg.binary_switch_status_enabled:
             messages.append(
                 ProtocolMessage(
                     PGN_BINARY_SWITCH_BANK_STATUS,
-                    build_binary_switch_bank_status(self._binary_switch_bank_instance(), self.binary_switch_states),
+                    build_binary_switch_bank_status(self._binary_switch_bank_instance(), cfg.binary_switch_states),
                     3,
                     GLOBAL_DESTINATION,
                     self._switch_source_address(),
@@ -779,35 +445,297 @@ class SimulatorApp:
             )
         return messages
 
+    def _expand_protocol_message(self, message: ProtocolMessage) -> list[tuple[int, bytes]]:
+        source = self._source_address() if message.source_address is None else message.source_address
+        frame_id = nmea2000_id(message.priority, message.pgn, source, message.destination)
+        if len(message.data) <= 8:
+            return [(frame_id, message.data)]
+        frames = split_fast_packet(message.data, self.fast_packet_sequence)
+        self.fast_packet_sequence = (self.fast_packet_sequence + 1) & 0x07
+        return [(frame_id, frame.ljust(8, b"\xFF")) for frame in frames]
+
     def current_frames(self) -> list[tuple[int, bytes]]:
         frames: list[tuple[int, bytes]] = []
         for message in self.current_messages():
             frames.extend(self._expand_protocol_message(message))
         return frames
 
-    def _update_button_states(self) -> None:
-        if self.is_connected:
-            self.connect_button.state(["disabled"])
-            self.disconnect_button.state(["!disabled"])
-            self.send_once_button.state(["!disabled"])
-            if self.send_job is None:
-                self.start_button.state(["!disabled"])
-                self.stop_button.state(["disabled"])
+    def send_once(self) -> None:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        for frame_id, data in self.current_frames():
+            self.device.send(frame_id, data)
+
+    def send_switch_command(self, switch_number: int, state_on: bool) -> None:
+        if not self.connected:
+            return
+        payload = build_group_function_binary_switch_command(self._binary_switch_bank_instance(), switch_number, state_on)
+        frame_id = nmea2000_id(DEFAULT_PRIORITY, PGN_GROUP_FUNCTION, self._source_address(), self._destination())
+        self.device.send(frame_id, payload)
+
+    def _periodic_worker(self) -> None:
+        while not self.stop_event.is_set():
+            start = time.time()
+            try:
+                with self.lock:
+                    self.send_once()
+            except Exception as exc:
+                self.status = f"Periodic send error: {exc}"
+                self.periodic_running = False
+                return
+            elapsed_ms = int((time.time() - start) * 1000)
+            wait_ms = max(10, self.config.interval_ms) - elapsed_ms
+            if self.stop_event.wait(max(0.01, wait_ms / 1000.0)):
+                break
+
+    def start_periodic(self) -> None:
+        if not self.connected or self.periodic_running:
+            return
+        self.stop_event.clear()
+        self.periodic_running = True
+        self.periodic_thread = threading.Thread(target=self._periodic_worker, daemon=True)
+        self.periodic_thread.start()
+        self.status = "Periodic sending started"
+
+    def stop_periodic(self) -> None:
+        if not self.periodic_running:
+            return
+        self.stop_event.set()
+        if self.periodic_thread and self.periodic_thread.is_alive():
+            self.periodic_thread.join(timeout=1.0)
+        self.periodic_running = False
+        self.periodic_thread = None
+        self.status = "Periodic sending stopped"
+
+
+app = Flask(__name__)
+service = SimulatorService()
+
+HTML_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <title>NMEA2000 SocketCAN Simulator</title>
+  <style>
+    body { font-family: sans-serif; margin: 1rem 2rem; }
+    fieldset { margin-bottom: 1rem; }
+    label { display:inline-block; min-width:220px; }
+    .grid { display:grid; grid-template-columns:repeat(2, minmax(350px, 1fr)); gap: 1rem; }
+    .switches form { display:inline-block; margin:2px; }
+  </style>
+</head>
+<body>
+  <h2>NMEA2000 SocketCAN Simulator (Flask)</h2>
+  <p><strong>Status:</strong> {{ status }}</p>
+
+  <form method=\"post\" action=\"{{ url_for('update') }}\">
+    <div class=\"grid\">
+      <fieldset>
+        <legend>Connection</legend>
+        <label>CAN interface index (0/1)</label><input name=\"can_interface_index\" value=\"{{ cfg.can_interface_index }}\" /><br/>
+        <label>Bitrate</label><input name=\"bitrate\" value=\"{{ cfg.bitrate }}\" /><br/>
+        <label>Interval ms</label><input name=\"interval_ms\" value=\"{{ cfg.interval_ms }}\" /><br/>
+      </fieldset>
+
+      <fieldset>
+        <legend>Node addressing</legend>
+        <label>Source address</label><input name=\"source_address\" value=\"{{ cfg.source_address }}\" /><br/>
+        <label>Destination</label><input name=\"destination_address\" value=\"{{ cfg.destination_address }}\" /><br/>
+        <label>Engine instance</label><input name=\"engine_instance\" value=\"{{ cfg.engine_instance }}\" /><br/>
+        <label>Device NAME</label><input name=\"device_name\" value=\"{{ '0x%X' % cfg.device_name }}\" /><br/>
+      </fieldset>
+
+      <fieldset>
+        <legend>Engine values</legend>
+        <label>Speed rpm</label><input name=\"engine_speed_rpm\" value=\"{{ cfg.engine_speed_rpm }}\" /><br/>
+        <label>Boost bar</label><input name=\"engine_boost_bar\" value=\"{{ cfg.engine_boost_bar }}\" /><br/>
+        <label>Trim %</label><input name=\"trim_percent\" value=\"{{ cfg.trim_percent }}\" /><br/>
+        <label>Oil pressure bar</label><input name=\"oil_pressure_bar\" value=\"{{ cfg.oil_pressure_bar }}\" /><br/>
+        <label>Oil temp C</label><input name=\"oil_temp_c\" value=\"{{ cfg.oil_temp_c }}\" /><br/>
+        <label>Coolant temp C</label><input name=\"coolant_temp_c\" value=\"{{ cfg.coolant_temp_c }}\" /><br/>
+        <label>Alternator V</label><input name=\"alternator_v\" value=\"{{ cfg.alternator_v }}\" /><br/>
+        <label>Fuel rate L/h</label><input name=\"fuel_rate_lph\" value=\"{{ cfg.fuel_rate_lph }}\" /><br/>
+        <label>Engine hours</label><input name=\"engine_hours_h\" value=\"{{ cfg.engine_hours_h }}\" /><br/>
+        <label>Coolant pressure bar</label><input name=\"coolant_pressure_bar\" value=\"{{ cfg.coolant_pressure_bar }}\" /><br/>
+        <label>Fuel pressure PSI</label><input name=\"fuel_pressure_psi\" value=\"{{ cfg.fuel_pressure_psi }}\" /><br/>
+        <label>Engine load %</label><input name=\"engine_load_percent\" value=\"{{ cfg.engine_load_percent }}\" /><br/>
+        <label>Engine torque %</label><input name=\"engine_torque_percent\" value=\"{{ cfg.engine_torque_percent }}\" /><br/>
+      </fieldset>
+
+      <fieldset>
+        <legend>Products + switch node</legend>
+        <label>ISO request PGN</label><input name=\"iso_request_pgn\" value=\"{{ cfg.iso_request_pgn }}\" /><br/>
+        <label>Product model</label><input name=\"product_model\" value=\"{{ cfg.product_model }}\" /><br/>
+        <label>Software version</label><input name=\"software_version\" value=\"{{ cfg.software_version }}\" /><br/>
+        <label>Model version</label><input name=\"model_version\" value=\"{{ cfg.model_version }}\" /><br/>
+        <label>Serial code</label><input name=\"serial_code\" value=\"{{ cfg.serial_code }}\" /><br/>
+        <hr/>
+        <label>Switch source address</label><input name=\"switch_node_source_address\" value=\"{{ cfg.switch_node_source_address }}\" /><br/>
+        <label>Switch NAME</label><input name=\"switch_node_device_name\" value=\"{{ '0x%X' % cfg.switch_node_device_name }}\" /><br/>
+        <label>Switch manufacturer code</label><input name=\"switch_manufacturer_code\" value=\"{{ cfg.switch_manufacturer_code }}\" /><br/>
+        <label>Switch model</label><input name=\"switch_product_model\" value=\"{{ cfg.switch_product_model }}\" /><br/>
+        <label>Switch software</label><input name=\"switch_software_version\" value=\"{{ cfg.switch_software_version }}\" /><br/>
+        <label>Switch model version</label><input name=\"switch_model_version\" value=\"{{ cfg.switch_model_version }}\" /><br/>
+        <label>Switch serial</label><input name=\"switch_serial_code\" value=\"{{ cfg.switch_serial_code }}\" /><br/>
+        <label>Bank instance</label><input name=\"binary_switch_bank_instance\" value=\"{{ cfg.binary_switch_bank_instance }}\" /><br/>
+      </fieldset>
+    </div>
+
+    <fieldset>
+      <legend>Enabled messages</legend>
+      {% for field, label in toggles %}
+      <label><input type=\"checkbox\" name=\"{{ field }}\" {% if getattr(cfg, field) %}checked{% endif %}/> {{ label }}</label>
+      {% endfor %}
+    </fieldset>
+
+    <button type=\"submit\">Save Configuration</button>
+  </form>
+
+  <p>
+    <a href=\"{{ url_for('action', name='connect') }}\">Connect</a> |
+    <a href=\"{{ url_for('action', name='disconnect') }}\">Disconnect</a> |
+    <a href=\"{{ url_for('action', name='send_once') }}\">Send Once</a> |
+    <a href=\"{{ url_for('action', name='start_periodic') }}\">Start Periodic</a> |
+    <a href=\"{{ url_for('action', name='stop_periodic') }}\">Stop Periodic</a>
+  </p>
+
+  <fieldset class=\"switches\">
+    <legend>Binary switches (toggle sends PGN 126208 command)</legend>
+    {% for idx, state in switches %}
+      <form method=\"post\" action=\"{{ url_for('set_switch', switch_no=idx) }}\">
+        <input type=\"hidden\" name=\"state\" value=\"{{ '0' if state else '1' }}\" />
+        <button type=\"submit\">SW {{ idx }}: {{ 'ON' if state else 'OFF' }}</button>
+      </form>
+    {% endfor %}
+  </fieldset>
+</body>
+</html>
+"""
+
+
+TOGGLE_FIELDS = [
+    ("address_claim_enabled", "ISO Address Claim"),
+    ("iso_request_enabled", "ISO Request"),
+    ("product_info_enabled", "Product Info"),
+    ("heartbeat_enabled", "Heartbeat"),
+    ("engine_rapid_enabled", "Engine Rapid PGN 127488"),
+    ("engine_dynamic_enabled", "Engine Dynamic PGN 127489"),
+    ("switch_address_claim_enabled", "Switch node Address Claim"),
+    ("switch_product_info_enabled", "Switch node Product Info"),
+    ("switch_heartbeat_enabled", "Switch node Heartbeat"),
+    ("binary_switch_status_enabled", "Binary Switch Bank Status PGN 127501"),
+]
+
+
+def parse_int(value: str, default: int = 0) -> int:
+    try:
+        text = value.strip()
+        return int(text, 16) if text.lower().startswith("0x") else int(float(text))
+    except Exception:
+        return default
+
+
+def parse_float(value: str, default: float = 0.0) -> float:
+    try:
+        return float(value.strip())
+    except Exception:
+        return default
+
+
+@app.get("/")
+def index() -> str:
+    with service.lock:
+        cfg = service.config
+        switches = list(enumerate(cfg.binary_switch_states, start=1))
+        return render_template_string(
+            HTML_TEMPLATE,
+            cfg=cfg,
+            status=service.status,
+            toggles=TOGGLE_FIELDS,
+            switches=switches,
+            getattr=getattr,
+        )
+
+
+@app.post("/update")
+def update() -> Any:
+    form = request.form
+    with service.lock:
+        cfg = service.config
+        cfg.can_interface_index = max(0, min(1, parse_int(form.get("can_interface_index", "0"), cfg.can_interface_index)))
+        cfg.bitrate = max(10000, parse_int(form.get("bitrate", str(cfg.bitrate)), cfg.bitrate))
+        cfg.interval_ms = max(10, parse_int(form.get("interval_ms", str(cfg.interval_ms)), cfg.interval_ms))
+        cfg.source_address = max(0, min(251, parse_int(form.get("source_address", str(cfg.source_address)), cfg.source_address)))
+        cfg.destination_address = max(0, min(255, parse_int(form.get("destination_address", str(cfg.destination_address)), cfg.destination_address)))
+        cfg.engine_instance = max(0, min(255, parse_int(form.get("engine_instance", str(cfg.engine_instance)), cfg.engine_instance)))
+        cfg.device_name = parse_int(form.get("device_name", hex(cfg.device_name)), cfg.device_name)
+
+        float_fields = [
+            "engine_speed_rpm", "engine_boost_bar", "trim_percent", "oil_pressure_bar", "oil_temp_c", "coolant_temp_c",
+            "alternator_v", "fuel_rate_lph", "engine_hours_h", "coolant_pressure_bar", "fuel_pressure_psi",
+            "engine_load_percent", "engine_torque_percent",
+        ]
+        for field in float_fields:
+            setattr(cfg, field, parse_float(form.get(field, str(getattr(cfg, field))), getattr(cfg, field)))
+
+        int_fields = [
+            "iso_request_pgn", "switch_node_source_address", "switch_node_device_name", "switch_manufacturer_code",
+            "binary_switch_bank_instance",
+        ]
+        for field in int_fields:
+            setattr(cfg, field, parse_int(form.get(field, str(getattr(cfg, field))), getattr(cfg, field)))
+
+        str_fields = [
+            "product_model", "software_version", "model_version", "serial_code", "switch_product_model",
+            "switch_software_version", "switch_model_version", "switch_serial_code",
+        ]
+        for field in str_fields:
+            setattr(cfg, field, form.get(field, getattr(cfg, field)))
+
+        for field, _ in TOGGLE_FIELDS:
+            setattr(cfg, field, field in form)
+
+        service.status = "Configuration updated"
+    return redirect(url_for("index"))
+
+
+@app.get("/action/<name>")
+def action(name: str) -> Any:
+    try:
+        with service.lock:
+            if name == "connect":
+                service.connect()
+            elif name == "disconnect":
+                service.disconnect()
+            elif name == "send_once":
+                service.send_once()
+                service.status = "Sent one batch of frames"
+            elif name == "start_periodic":
+                service.start_periodic()
+            elif name == "stop_periodic":
+                service.stop_periodic()
             else:
-                self.start_button.state(["disabled"])
-                self.stop_button.state(["!disabled"])
-        else:
-            self.connect_button.state(["!disabled"])
-            self.disconnect_button.state(["disabled"])
-            self.send_once_button.state(["disabled"])
-            self.start_button.state(["disabled"])
-            self.stop_button.state(["disabled"])
+                service.status = f"Unknown action: {name}"
+    except Exception as exc:
+        service.status = f"Action '{name}' failed: {exc}"
+    return redirect(url_for("index"))
+
+
+@app.post("/switch/<int:switch_no>")
+def set_switch(switch_no: int) -> Any:
+    switch_index = max(1, min(12, switch_no)) - 1
+    state = request.form.get("state", "0") == "1"
+    with service.lock:
+        service.config.binary_switch_states[switch_index] = state
+        service.send_switch_command(switch_index + 1, state)
+        service.status = f"Switch {switch_index + 1} set to {'ON' if state else 'OFF'}"
+    return redirect(url_for("index"))
 
 
 def main() -> None:
-    root = tk.Tk()
-    SimulatorApp(root)
-    root.mainloop()
+    # Flask HTTP server must run on port 8080 per project requirement.
+    app.run(host="0.0.0.0", port=8080, debug=False)
 
 
 if __name__ == "__main__":
