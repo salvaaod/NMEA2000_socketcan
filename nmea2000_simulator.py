@@ -602,7 +602,7 @@ HTML_TEMPLATE = """
     body { font-family: sans-serif; margin: 1rem 2rem; }
     fieldset { margin-bottom: 1rem; }
     label { display:inline-block; min-width:220px; }
-    .grid { display:grid; grid-template-columns:repeat(2, minmax(350px, 1fr)); gap: 1rem; }
+    .grid { display:grid; grid-template-columns:repeat(4, minmax(240px, 1fr)); gap: 1rem; }
     .switches form { display:inline-block; margin:2px; }
   </style>
 </head>
@@ -664,7 +664,8 @@ HTML_TEMPLATE = """
     </div>
 
     <fieldset>
-      <legend>Enabled messages</legend>
+      <legend>Enabled data PGNs</legend>
+      <p>Protocol PGNs are always enabled.</p>
       {% for field, label in toggles %}
       <label><input type=\"checkbox\" name=\"{{ field }}\" {% if getattr(cfg, field) %}checked{% endif %}/> {{ label }}</label>
       {% endfor %}
@@ -696,16 +697,19 @@ HTML_TEMPLATE = """
 
 
 TOGGLE_FIELDS = [
-    ("address_claim_enabled", "ISO Address Claim"),
-    ("iso_request_enabled", "ISO Request"),
-    ("product_info_enabled", "Product Info"),
-    ("heartbeat_enabled", "Heartbeat"),
     ("engine_rapid_enabled", "Engine Rapid PGN 127488"),
     ("engine_dynamic_enabled", "Engine Dynamic PGN 127489"),
-    ("switch_address_claim_enabled", "Switch node Address Claim"),
-    ("switch_product_info_enabled", "Switch node Product Info"),
-    ("switch_heartbeat_enabled", "Switch node Heartbeat"),
     ("binary_switch_status_enabled", "Binary Switch Bank Status PGN 127501"),
+]
+
+PROTOCOL_ALWAYS_ENABLED_FIELDS = [
+    "address_claim_enabled",
+    "iso_request_enabled",
+    "product_info_enabled",
+    "heartbeat_enabled",
+    "switch_address_claim_enabled",
+    "switch_product_info_enabled",
+    "switch_heartbeat_enabled",
 ]
 
 
@@ -776,6 +780,8 @@ def update() -> Any:
 
         for field, _ in TOGGLE_FIELDS:
             setattr(cfg, field, field in form)
+        for field in PROTOCOL_ALWAYS_ENABLED_FIELDS:
+            setattr(cfg, field, True)
 
         service.status = "Configuration updated"
     return redirect(url_for("index"))
