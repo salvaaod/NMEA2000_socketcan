@@ -138,8 +138,7 @@ class SocketCANDevice:
         if not self.bus:
             raise RuntimeError("SocketCAN bus not connected")
         msg = can.Message(arbitration_id=frame_id, data=data, is_extended_id=True)
-        retries = 5
-        for attempt in range(retries):
+        while True:
             try:
                 self.bus.send(msg, timeout=0.2)
                 return
@@ -147,10 +146,9 @@ class SocketCANDevice:
                 error_code = getattr(exc, "error_code", None)
                 if error_code != ENOBUFS and "No buffer space available" not in str(exc):
                     raise
-                if attempt == retries - 1:
-                    raise
-                # SocketCAN TX queue is full; wait briefly and retry.
-                time.sleep(0.01)
+                # With no ACKing peer on the bus, SocketCAN can report ENOBUFS.
+                # Keep retrying until the bus becomes ready again.
+                time.sleep(0.05)
 
     def recv(self, timeout: float = 0.0) -> can.Message | None:
         if not self.bus:
